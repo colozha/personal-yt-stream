@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only static server and session-scoped YouTube HLS proxy."""
+"""Loopback-only static server and session-scoped YouTube media proxy."""
 
 import ipaddress
 import json
@@ -10,6 +10,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,8 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 ROOT = Path(__file__).resolve().parent
 PORT = 5173
 SESSION_TTL = 30 * 60
+PREPARATION_TIMEOUT = 90
+LOCAL_EXTRACTOR = ROOT / ".tools" / "yt-dlp"
 # Long recordings contain thousands of signed segment URLs, even without media data.
 MANIFEST_LIMIT = 16 * 1024 * 1024
 SESSIONS = {}
@@ -53,7 +56,7 @@ class SourceRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_source(url, headers, byte_range=None):
+def open_source(url, headers, byte_range=None, timeout=20):
     validate_source(url)
     request_headers = {k: v for k, v in headers.items()
                        if k.lower() in ("user-agent", "referer", "accept-language")}
@@ -62,7 +65,7 @@ def open_source(url, headers, byte_range=None):
         request_headers["Range"] = byte_range
     # Do not inherit a system proxy that could redirect these requests to a private service.
     return build_opener(ProxyHandler({}), SourceRedirect()).open(
-        Request(url, headers=request_headers), timeout=20)
+        Request(url, headers=request_headers), timeout=timeout)
 
 
 def read_manifest(response):
@@ -132,43 +135,103 @@ def prune_sessions():
                 del SESSIONS[key]
 
 
+def preparation_time_left(deadline, maximum):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PlaybackError(504, "EXTRACTION_TIMEOUT", "Persiapan stream melewati batas 90 detik. Coba lagi.")
+    return min(remaining, maximum)
+
+
+def prepare_source(info, deadline):
+    formats = info.get("formats", [])
+    hls = [item for item in formats if item.get("manifest_url") and not item.get("has_drm")
+           and item.get("protocol", "").startswith("m3u8")]
+    mp4 = sorted([item for item in formats
+                  if item.get("url") and not item.get("has_drm") and item.get("protocol") == "https"
+                  and item.get("ext") == "mp4" and 0 < (item.get("height") or 0) <= 720
+                  and (item.get("vcodec") or "").startswith("avc1")
+                  and (item.get("acodec") or "").startswith("mp4a")],
+                 key=lambda item: (item["height"], item.get("tbr") or 0), reverse=True)
+    candidates = ([hls[0]] if hls else []) + mp4
+    if not candidates:
+        raise PlaybackError(415, "UNSUPPORTED_FORMAT", "Video ini tidak menyediakan HLS atau MP4 dengan audio yang dapat diputar.")
+    for index, item in enumerate(candidates):
+        headers = item.get("http_headers", info.get("http_headers", {}))
+        session = {"id": secrets.token_hex(16), "accessed": time.monotonic(),
+                   "headers": headers, "resources": {}, "urls": {}}
+        is_hls = item in hls
+        source = item["manifest_url"] if is_hls else item["url"]
+        try:
+            with open_source(source, headers, None if is_hls else "bytes=0-1023",
+                             timeout=preparation_time_left(deadline, 10)) as response:
+                if is_hls:
+                    master = filter_master(read_manifest(response))
+                    session["manifest"] = rewrite_manifest(master, response.url, session)
+                else:
+                    if response.status != 206 or response.headers.get_content_type() != "video/mp4":
+                        raise PlaybackError(415, "UNSUPPORTED_FORMAT", "Sumber MP4 tidak mendukung streaming dengan seek.")
+                    probe = response.read(1024)
+                    if len(probe) < 8 or probe[4:8] != b"ftyp":
+                        raise PlaybackError(415, "UNSUPPORTED_FORMAT", "Sumber tidak berisi video MP4 yang valid.")
+                    session["mediaUrl"] = resource_url(session, response.url)
+            preparation_time_left(deadline, 10)
+            return session
+        except HTTPError as error:
+            error.close()
+            if index == len(candidates) - 1:
+                raise
+        except PlaybackError as error:
+            if error.code != "UNSUPPORTED_FORMAT" or index == len(candidates) - 1:
+                raise
+
+
 def create_session(video_id):
-    if not shutil.which("yt-dlp") or not shutil.which("node"):
+    extractor = ([sys.executable, str(LOCAL_EXTRACTOR)] if LOCAL_EXTRACTOR.is_file()
+                 else [shutil.which("yt-dlp")])
+    if not extractor[0] or not shutil.which("node"):
         raise PlaybackError(503, "MISSING_DEPENDENCY", "Fallback memerlukan yt-dlp dan Node.js di komputer server.")
     if not EXTRACTIONS.acquire(blocking=False):
         raise PlaybackError(503, "BUSY", "Pemutar alternatif sedang menyiapkan video lain. Coba lagi sebentar.")
+    deadline = time.monotonic() + PREPARATION_TIMEOUT
     try:
-        result = subprocess.run([
-            "yt-dlp", "--ignore-config", "--no-cache-dir", "--no-playlist", "--skip-download",
-            "--dump-single-json", "--js-runtimes", "node", "--socket-timeout", "10",
-            "--retries", "0", "--extractor-retries", "0", "--",
-            f"https://www.youtube.com/watch?v={video_id}",
-        ], capture_output=True, text=True, timeout=45)
-    except subprocess.TimeoutExpired:
-        raise PlaybackError(504, "EXTRACTION_TIMEOUT", "Pengambilan stream melewati batas 45 detik. Coba lagi.") from None
-    except OSError:
-        raise PlaybackError(503, "MISSING_DEPENDENCY", "yt-dlp atau Node.js tidak dapat dijalankan.") from None
+        for attempt in range(2):
+            try:
+                result = subprocess.run(extractor + [
+                    "--ignore-config", "--no-cache-dir", "--no-playlist", "--skip-download",
+                    "--dump-single-json", "--js-runtimes", "node", "--socket-timeout", "10",
+                    "--retries", "0", "--extractor-retries", "0", "--",
+                    f"https://www.youtube.com/watch?v={video_id}",
+                ], capture_output=True, text=True, timeout=preparation_time_left(deadline, 35))
+                if result.returncode:
+                    reason = result.stderr.lower()
+                    if any(message in reason for message in ("private video", "video has been removed", "video is unavailable", "video is not available")):
+                        raise PlaybackError(404, "VIDEO_UNAVAILABLE", "Video tidak tersedia untuk pemutar alternatif atau memerlukan akses khusus.")
+                    if any(message in reason for message in ("sign in", "age-restricted", "not available in your country")):
+                        raise PlaybackError(403, "VIDEO_RESTRICTED", "YouTube membatasi akses video ini. Pemutar lokal tidak menggunakan akun YouTube.")
+                    if attempt == 0:
+                        continue
+                    raise PlaybackError(502, "EXTRACTION_FAILED", "Stream gagal diambil setelah dua percobaan. Periksa koneksi dan versi yt-dlp.")
+                try:
+                    info = json.loads(result.stdout)
+                    if not isinstance(info, dict) or not isinstance(info.get("formats"), list) or any(not isinstance(item, dict) for item in info["formats"]):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    raise PlaybackError(502, "EXTRACTION_FAILED", "Respons extractor tidak dapat dibaca.") from None
+                session = prepare_source(info, deadline)
+                break
+            except subprocess.TimeoutExpired:
+                if attempt:
+                    raise PlaybackError(504, "EXTRACTION_TIMEOUT", "Pengambilan stream terlalu lama setelah dua percobaan. Coba lagi.") from None
+            except HTTPError as error:
+                if attempt or error.code not in (403, 410, 429, 500, 502, 503, 504):
+                    raise
+            except (TimeoutError, URLError):
+                if attempt:
+                    raise PlaybackError(502, "SOURCE_UNAVAILABLE", "Sumber streaming tidak dapat dihubungi setelah dua percobaan. Periksa koneksi.") from None
+            except OSError:
+                raise PlaybackError(503, "MISSING_DEPENDENCY", "yt-dlp atau Node.js tidak dapat dijalankan.") from None
     finally:
         EXTRACTIONS.release()
-    if result.returncode:
-        raise PlaybackError(502, "EXTRACTION_FAILED", "Stream alternatif tidak dapat diambil. Video mungkin dibatasi atau YouTube menolak akses.")
-    try:
-        info = json.loads(result.stdout)
-        candidates = [item for item in info.get("formats", [])
-                      if item.get("manifest_url") and not item.get("has_drm")
-                      and item.get("protocol", "").startswith("m3u8")]
-        if not candidates:
-            raise PlaybackError(415, "UNSUPPORTED_FORMAT", "Video ini tidak menyediakan HLS yang dapat dipakai oleh fallback.")
-        source = candidates[0]["manifest_url"]
-        headers = candidates[0].get("http_headers", info.get("http_headers", {}))
-    except (ValueError, TypeError, KeyError):
-        raise PlaybackError(502, "EXTRACTION_FAILED", "Respons extractor tidak dapat dibaca.") from None
-    with open_source(source, headers) as response:
-        master = filter_master(read_manifest(response))
-        source = response.url
-    session = {"id": secrets.token_hex(16), "accessed": time.monotonic(),
-               "headers": headers, "resources": {}, "urls": {}}
-    session["manifest"] = rewrite_manifest(master, source, session)
     with LOCK:
         prune_sessions()
         if len(SESSIONS) >= 16:
@@ -227,8 +290,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise PlaybackError(400, "INVALID_INPUT", "videoId harus berupa ID YouTube 11 karakter.") from None
                 session = create_session(video_id)
                 try:
-                    self.json_response(201, {"sessionId": session["id"],
-                                            "manifestUrl": f'/api/playback/{session["id"]}/manifest.m3u8'})
+                    source = ({"mediaUrl": session["mediaUrl"]} if "mediaUrl" in session else
+                              {"manifestUrl": f'/api/playback/{session["id"]}/manifest.m3u8'})
+                    self.json_response(201, {"sessionId": session["id"], **source})
                 except (BrokenPipeError, ConnectionResetError):
                     with LOCK:
                         SESSIONS.pop(session["id"], None)
@@ -249,6 +313,8 @@ class Handler(BaseHTTPRequestHandler):
                 if self.command not in ("GET", "HEAD") or not resource:
                     raise PlaybackError(404, "NOT_FOUND", "Endpoint tidak ditemukan.")
                 if resource == "manifest.m3u8":
+                    if "manifest" not in session:
+                        raise PlaybackError(404, "NOT_FOUND", "Sesi ini tidak memakai playlist HLS.")
                     body = session["manifest"].encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -336,13 +402,13 @@ if __name__ == "__main__":
 
         def get_request(self):
             connection, address = super().get_request()
-            connection.settimeout(65)
+            connection.settimeout(110)
             return connection, address
 
     try:
         with Server(("127.0.0.1", PORT), Handler) as server:
             print(f"Ruang Putar: http://127.0.0.1:{PORT}", flush=True)
-            if not shutil.which("yt-dlp") or not shutil.which("node"):
+            if (not LOCAL_EXTRACTOR.is_file() and not shutil.which("yt-dlp")) or not shutil.which("node"):
                 print("Fallback belum tersedia: pasang yt-dlp dan Node.js. Player resmi tetap dapat digunakan.", flush=True)
             server.serve_forever()
     except KeyboardInterrupt:

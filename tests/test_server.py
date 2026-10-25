@@ -22,12 +22,16 @@ video.m3u8
 too-large.m3u8
 '''
 SOURCE = 'https://manifest.googlevideo.com/master.m3u8'
+MP4_SOURCE = 'https://r.googlevideo.com/videoplayback'
+MP4 = {'protocol': 'https', 'url': MP4_SOURCE, 'ext': 'mp4', 'height': 240,
+       'vcodec': 'avc1.42001E', 'acodec': 'mp4a.40.2'}
+MP4_BYTES = b'\x00\x00\x00\x18ftypisom' + b'\x00' * 1012
 
 
 class Response(io.BytesIO):
     def __init__(self, body, status=200, content_type='application/vnd.apple.mpegurl', **headers):
         super().__init__(body)
-        self.url, self.status = SOURCE, status
+        self.url, self.status = (MP4_SOURCE if content_type == 'video/mp4' else SOURCE), status
         self.headers = Message()
         self.headers['Content-Type'] = content_type
         self.headers['Content-Length'] = str(len(body))
@@ -145,7 +149,7 @@ class APITests(unittest.TestCase):
         for headers in [{'Origin': 'https://evil.example'}, {'Origin': 'null'},
                         {'Host': 'evil.example'}, {'Sec-Fetch-Site': 'cross-site'}]:
             self.assertEqual(self.request('/', headers=headers)[0], 403)
-        for path in ['/server.py', '/README.md', '/tests/test_server.py', '/.git/config', '/assets/../server.py']:
+        for path in ['/server.py', '/README.md', '/tests/test_server.py', '/.git/config', '/assets/../server.py', '/.tools/yt-dlp']:
             self.assertEqual(self.request(path)[0], 404)
         self.assertEqual(self.request('/')[0], 200)
         self.assertEqual(self.request('/app.js')[0], 200)
@@ -175,6 +179,71 @@ class APITests(unittest.TestCase):
         for _ in range(2):
             self.assertEqual(self.request(f"/api/playback/{info['sessionId']}", 'DELETE')[0], 200)
         self.assertEqual(self.request(info['manifestUrl'])[0], 410)
+
+    def test_mp4_selects_highest_muxed_h264_with_audio_and_supports_range(self):
+        extracted = {'formats': [MP4, {**MP4, 'height': 720, 'url': MP4_SOURCE + '?hd'},
+                                 {**MP4, 'height': 1080}, {**MP4, 'height': 720, 'acodec': 'none'},
+                                 {**MP4, 'height': 720, 'vcodec': 'vp9'},
+                                 {**MP4, 'height': 720, 'has_drm': True}]}
+        result = subprocess.CompletedProcess([], 0, json.dumps(extracted), '')
+        with patch('server.shutil.which', return_value='/bin/tool'), patch('server.subprocess.run', return_value=result), patch('server.open_source', return_value=Response(MP4_BYTES, 206, 'video/mp4')) as upstream:
+            code, _, data = self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})
+        self.assertEqual(code, 201)
+        self.assertEqual(upstream.call_args.args, (MP4_SOURCE + '?hd', {}, 'bytes=0-1023'))
+        info = json.loads(data)
+        self.assertIn('mediaUrl', info)
+        self.assertNotIn('manifestUrl', info)
+        self.assertNotIn('googlevideo', data.decode())
+        self.assertEqual(self.request(f'/api/playback/{info["sessionId"]}/manifest.m3u8')[0], 404)
+        with patch('server.open_source', return_value=Response(MP4_BYTES[:8], 206, 'video/mp4', Content_Range='bytes 0-7/1024', Accept_Ranges='bytes')):
+            code, headers, body = self.request(info['mediaUrl'], headers={'Range': 'bytes=0-7'})
+        self.assertEqual((code, body, headers['Content-Range']), (206, MP4_BYTES[:8], 'bytes 0-7/1024'))
+        with patch('server.open_source', side_effect=HTTPError(MP4_SOURCE, 416, '', Message(), io.BytesIO())):
+            self.assertEqual(self.request(info['mediaUrl'], headers={'Range': 'bytes=9999-'})[0], 416)
+
+    def test_hls_unusable_falls_back_to_mp4_without_reextracting(self):
+        extracted = {'formats': [{'protocol': 'm3u8_native', 'manifest_url': SOURCE}, MP4]}
+        result = subprocess.CompletedProcess([], 0, json.dumps(extracted), '')
+        responses = [Response(b'#EXTM3U\n'), Response(MP4_BYTES, 206, 'video/mp4')]
+        with patch('server.shutil.which', return_value='/bin/tool'), patch('server.subprocess.run', return_value=result) as run, patch('server.open_source', side_effect=responses):
+            code, _, data = self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})
+        self.assertEqual(code, 201)
+        self.assertIn('mediaUrl', json.loads(data))
+        self.assertEqual(run.call_count, 1)
+
+    def test_rejected_source_reextracts_once_then_succeeds_or_stops(self):
+        result = subprocess.CompletedProcess([], 0, json.dumps({'formats': [MP4]}), '')
+        for failure in (403, 410):
+            for succeeds in (True, False):
+                server.SESSIONS.clear()
+                rejected = HTTPError(MP4_SOURCE, failure, '', Message(), io.BytesIO())
+                responses = [rejected, Response(MP4_BYTES, 206, 'video/mp4') if succeeds else rejected]
+                with self.subTest(failure=failure, succeeds=succeeds), patch('server.shutil.which', return_value='/bin/tool'), patch('server.subprocess.run', return_value=result) as run, patch('server.open_source', side_effect=responses):
+                    code, _, _ = self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})
+                self.assertEqual(code, 201 if succeeds else failure)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(len(server.SESSIONS), 1 if succeeds else 0)
+
+    def test_invalid_mp4_and_missing_audio_are_not_accepted(self):
+        for formats, body in (([MP4], b'<html>denied</html>'), ([{**MP4, 'acodec': 'none'}], MP4_BYTES)):
+            result = subprocess.CompletedProcess([], 0, json.dumps({'formats': formats}), '')
+            with patch('server.shutil.which', return_value='/bin/tool'), patch('server.subprocess.run', return_value=result) as run, patch('server.open_source', return_value=Response(body, 206, 'video/mp4')):
+                self.assertEqual(self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})[0], 415)
+            self.assertEqual(run.call_count, 1)
+
+    def test_transient_extraction_retries_but_unavailable_video_does_not(self):
+        success = subprocess.CompletedProcess([], 0, json.dumps({'formats': [MP4]}), '')
+        for message, expected, attempts in [('Connection timed out', 201, 2), ('Private video', 404, 1),
+                                           ('This video is unavailable', 404, 1), ('Sign in to confirm your age', 403, 1)]:
+            failed = subprocess.CompletedProcess([], 1, '', message)
+            with self.subTest(message=message), patch('server.shutil.which', return_value='/bin/tool'), patch('server.subprocess.run', side_effect=[failed, success]) as run, patch('server.open_source', return_value=Response(MP4_BYTES, 206, 'video/mp4')):
+                self.assertEqual(self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})[0], expected)
+            self.assertEqual(run.call_count, attempts)
+
+    def test_expired_preparation_deadline_never_starts_extractor(self):
+        with patch('server.shutil.which', return_value='/bin/tool'), patch('server.PREPARATION_TIMEOUT', 0), patch('server.subprocess.run') as run:
+            self.assertEqual(self.request('/api/playback', 'POST', {'videoId': 'A3WhzglZ-lQ'})[0], 504)
+        run.assert_not_called()
 
     def test_dependency_failure_timeout_and_no_hls(self):
         with patch('server.shutil.which', return_value=None):

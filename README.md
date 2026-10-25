@@ -1,17 +1,26 @@
 # Ruang Putar
 
-Web app sederhana untuk menyimpan link YouTube dan menonton di halaman yang sama. Player resmi dicoba terlebih dahulu. Jika gagal secara teknis, app otomatis mencoba streaming HLS melalui backend lokal berbasis yt-dlp, dengan dukungan seek.
+Web app sederhana untuk menyimpan link YouTube dan menonton di halaman yang sama. Player resmi dicoba terlebih dahulu. Jika gagal secara teknis, app otomatis mencoba HLS lalu MP4 dengan audio melalui backend lokal berbasis yt-dlp, dengan dukungan seek.
 
 ## Jalankan
 
-Kebutuhan: **Python 3.11+**, **Node.js 22+**, dan **yt-dlp** yang mutakhir pada `PATH`. Tidak ada paket Python server tambahan atau proses build frontend. Untuk dukungan YouTube lengkap, instalasi yt-dlp juga perlu komponen `yt-dlp-ejs`; ikuti [panduan resmi EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS). Server tidak memasang atau memperbarui dependensi secara otomatis.
+Kebutuhan: **Python 3.11+**, **Node.js 22+**, dan **yt-dlp 2026.10.21 atau lebih baru**. Tidak ada paket Python server tambahan atau proses build frontend. Untuk dukungan YouTube lengkap, instalasi yt-dlp juga perlu komponen `yt-dlp-ejs`; ikuti [panduan resmi EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS). Server tidak memasang atau memperbarui dependensi secara otomatis.
 
-Periksa dependensi:
+Server mengutamakan executable zip Python lokal `.tools/yt-dlp`, lalu mencari `yt-dlp` pada `PATH`. Pasang rilis lokal dengan EJS yang disertakan tanpa mengubah paket sistem:
+
+```sh
+mkdir -p .tools
+curl -fL https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp -o .tools/yt-dlp
+curl -fL https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/SHA2-256SUMS -o .tools/SHA2-256SUMS
+(cd .tools && grep '  yt-dlp$' SHA2-256SUMS | sha256sum --check -)
+```
+
+Folder `.tools/` diabaikan Git dan tidak disajikan oleh server. Unduh ulang kedua file dan verifikasi checksum sebelum menjalankan rilis pengganti. Periksa dependensi:
 
 ```sh
 python3 --version
 node --version
-yt-dlp --version
+python3 .tools/yt-dlp --version
 ```
 
 Dari folder proyek, hentikan server statis lama pada port 5173 jika masih berjalan, lalu:
@@ -42,24 +51,25 @@ Judul dan thumbnail diambil melalui YouTube oEmbed dengan batas tunggu 8 detik. 
 ## Cara kerja fallback
 
 - Fallback dicoba satu kali per pilihan video untuk error player selain `2` (input invalid) dan `100` (video tidak tersedia/privat), kegagalan memuat API, player belum siap setelah 15 detik, atau buffering 30 detik saat pemutaran diminta. Autoplay diblokir, pause, dan video selesai tidak memicu fallback.
-- Backend mengekstrak metadata stream dengan batas 45 detik, tanpa konfigurasi pengguna, login/cookies akun, atau cache disk. Stream tidak diunduh penuh. Hanya HLS non-DRM H.264 hingga 720p yang didukung; audio dan video disalurkan melalui proxy lokal yang sama.
-- Browser dengan MediaSource memakai HLS.js 1.7.3, dimuat lokal hanya ketika diperlukan. HLS native dipakai bila MediaSource tidak didukung dan browser menyediakan HLS native. Pemilihan ini menghindari kegagalan seek HLS native Chromium pada rekaman panjang. Kontrol HTML5 menyediakan play/pause, volume, fullscreen, dan seek. Seek siaran langsung mengikuti rentang DVR yang tersedia.
+- Backend menyiapkan stream dengan anggaran total 90 detik (maksimal 35 detik per ekstraksi), tanpa konfigurasi pengguna, login/cookies akun, atau cache disk. Stream tidak diunduh penuh. HLS non-DRM H.264 hingga 720p dicoba dahulu. Jika tidak tersedia atau tidak dapat dipakai, backend memilih MP4 gabungan H.264/AAC hingga 720p dengan kualitas tertinggi yang menyediakan audio. Sumber diperiksa sebelum sesi dikembalikan; penolakan 403/410 dan kegagalan jaringan sementara mendapat satu ekstraksi ulang. Video privat, dihapus, atau memerlukan akun tidak diulang otomatis. Frontend menunggu respons persiapan hingga 105 detik; koneksi server diberi batas 110 detik.
+- Pemuatan media setelah sesi siap diberi waktu maksimal 90 detik agar playlist audio/video rekaman panjang sempat dimuat. Setelah pemutaran dimulai, buffering gagal jika tidak ada progres data selama 60 detik; playlist atau segmen yang diterima memperbarui batas tunggu. Pause dan autoplay yang diblokir tidak dihitung sebagai buffering.
+- Browser dengan MediaSource memakai HLS.js 1.7.3, dimuat lokal hanya ketika diperlukan. HLS native dipakai bila MediaSource tidak didukung dan browser menyediakan HLS native. Pemilihan ini menghindari kegagalan seek HLS native Chromium pada rekaman panjang. MP4 menggunakan elemen video native tanpa memuat HLS.js. Kontrol HTML5 menyediakan play/pause, volume, fullscreen, dan seek. Seek siaran langsung mengikuti rentang DVR yang tersedia.
 - URL stream bertanda tangan disimpan hanya dalam sesi server, bukan koleksi localStorage. Semua sumber harus berupa CDN YouTube HTTPS. API tidak menerima URL proxy bebas.
 - Sesi dilepas saat video diganti/dihapus atau halaman ditutup; sesi yang tertinggal dibersihkan setelah 30 menit tanpa aktivitas. Tidak ada penyimpanan video ke disk.
-- Ketika sumber menolak akses dengan `403/410` atau sesi kedaluwarsa, app mencoba membuat sesi baru sekali dan melanjutkan posisi. HLS native tidak mengekspos HTTP status; network error native mendapat satu percobaan pembaruan yang sama. Jika tetap gagal, tombol **Coba lagi** mengulang dari player resmi.
-- Video privat, dihapus, dibatasi wilayah/usia, tidak menyediakan HLS, atau ditolak YouTube tetap dapat gagal. Tidak ada DASH, FFmpeg, transcoding, download penuh, atau layanan proxy publik sebagai fallback lanjutan.
+- Ketika sumber menolak akses dengan `403/410` atau sesi kedaluwarsa, app mencoba membuat sesi baru sekali dan melanjutkan posisi. HLS native dan MP4 tidak mengekspos HTTP status; network error native mendapat satu percobaan pembaruan yang sama. Jika tetap gagal, tombol **Coba lagi** mengulang dari player resmi.
+- Video privat, dihapus, dibatasi wilayah/usia, tidak menyediakan HLS atau MP4 gabungan yang dapat diakses, atau ditolak YouTube tetap dapat gagal. Tidak ada DASH, FFmpeg, transcoding, download penuh, atau layanan proxy publik sebagai fallback lanjutan.
 - Ekstraksi dan penyaluran ulang konten perlu mempertimbangkan izin pemilik serta [ketentuan YouTube](https://www.youtube.com/static?template=terms). Keberhasilan teknis bukan izin penggunaan.
 
 ## API lokal
 
 | Endpoint | Fungsi |
 | --- | --- |
-| `POST /api/playback` | Body JSON `{ "videoId": "…" }`; sukses `201` dengan `{ sessionId, manifestUrl }`. |
+| `POST /api/playback` | Body JSON `{ "videoId": "…" }`; sukses `201` dengan `{ sessionId, manifestUrl }` untuk HLS atau `{ sessionId, mediaUrl }` untuk MP4. |
 | `GET /api/playback/{sessionId}/manifest.m3u8` | Master HLS dengan sumber diganti alamat proxy lokal. |
-| `GET /api/playback/{sessionId}/resource/{resourceId}` | Playlist/segmen terdaftar; mendukung byte Range dan respons `206/416`. |
+| `GET /api/playback/{sessionId}/resource/{resourceId}` | Playlist/segmen/MP4 terdaftar; mendukung byte Range dan respons `206/416`. |
 | `DELETE /api/playback/{sessionId}` | Lepaskan sesi; idempotent. |
 
-Error berbentuk `{ code, message }`: `400` input invalid, `403` origin/host/sumber ditolak, `404` resource tidak ditemukan, `410` sesi kedaluwarsa, `415` format tidak didukung, `502` ekstraksi/sumber gagal, `503` dependensi tidak tersedia atau server sibuk, `504` ekstraksi timeout. Maksimal dua ekstraksi bersamaan dan 16 sesi aktif. Backend hanya menyajikan file frontend dan `assets/`, bukan source server atau direktori proyek.
+Error berbentuk `{ code, message }`: `400` input invalid, `403` origin/host/sumber ditolak, `404` video/resource tidak tersedia, `410` sesi kedaluwarsa, `415` format tidak didukung, `502` ekstraksi/sumber gagal, `503` dependensi tidak tersedia atau server sibuk, `504` ekstraksi timeout. Maksimal dua ekstraksi bersamaan dan 16 sesi aktif. Backend hanya menyajikan file frontend dan `assets/`, bukan source server atau direktori proyek.
 
 ## Verifikasi
 

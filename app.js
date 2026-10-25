@@ -176,7 +176,7 @@ function setPlayerStatus(message, label, error = false) {
 }
 
 function clearPlayerTimers(state) {
-  for (const key of ['readyTimer', 'bufferTimer', 'fallbackTimer']) clearTimeout(state[key]);
+  for (const key of ['readyTimer', 'bufferTimer', 'fallbackStartupTimer', 'fallbackBufferTimer']) clearTimeout(state[key]);
 }
 
 function releaseSession(id) {
@@ -192,7 +192,8 @@ function stopOfficial(state) {
 }
 
 function stopFallback(state) {
-  clearTimeout(state.fallbackTimer);
+  clearTimeout(state.fallbackStartupTimer);
+  clearTimeout(state.fallbackBufferTimer);
   const media = state.media;
   state.media = null;
   if (state.hls) state.hls.destroy();
@@ -274,7 +275,7 @@ async function prepareFallback(state, position) {
   setPlayerStatus(state.renewed ? 'Memperbarui sesi streaming…' : 'Mencoba pemutar alternatif…', 'Pemutar alternatif');
   const controller = new AbortController();
   state.controller = controller;
-  const timeout = setTimeout(() => controller.abort(), 65000);
+  const timeout = setTimeout(() => controller.abort(), 105000);
   try {
     const response = await fetch('/api/playback', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -285,7 +286,12 @@ async function prepareFallback(state, position) {
     }
     const data = await response.json();
     if (!response.ok) throw new Error(data.message || 'Stream alternatif tidak dapat disiapkan.');
-    if (!/^[a-f0-9]{32}$/.test(data.sessionId) || data.manifestUrl !== `/api/playback/${data.sessionId}/manifest.m3u8`) {
+    if (!/^[a-f0-9]{32}$/.test(data.sessionId)) throw new Error('Respons server alternatif tidak valid.');
+    const mp4 = typeof data.mediaUrl === 'string';
+    const validSource = mp4
+      ? !data.manifestUrl && new RegExp(`^/api/playback/${data.sessionId}/resource/[a-f0-9]{24}$`).test(data.mediaUrl)
+      : data.manifestUrl === `/api/playback/${data.sessionId}/manifest.m3u8`;
+    if (!validSource) {
       throw new Error('Respons server alternatif tidak valid.');
     }
     if (!isCurrent(state) || state.failed) { releaseSession(data.sessionId); return; }
@@ -298,18 +304,44 @@ async function prepareFallback(state, position) {
     media.setAttribute('aria-label', `Pemutar alternatif: ${state.video.title}`);
     let nativeHls = !!media.canPlayType('application/vnd.apple.mpegurl');
     // Chromium's native HLS can fail on seeks in long recordings; prefer MSE when supported.
-    if (window.MediaSource || window.ManagedMediaSource) {
+    if (!mp4 && (window.MediaSource || window.ManagedMediaSource)) {
       await loadHls();
       if (!isCurrent(state) || state.failed) return;
       if (Hls.isSupported()) nativeHls = false;
     }
-    if (!nativeHls && !window.Hls?.isSupported()) throw new Error('Browser ini belum mendukung pemutar alternatif HLS.');
+    if (!mp4 && !nativeHls && !window.Hls?.isSupported()) throw new Error('Browser ini belum mendukung pemutar alternatif HLS.');
     clearTimeout(timeout);
     state.media = media;
     state.preparing = false;
     const current = () => isCurrent(state) && !state.failed && state.media === media;
     mount.replaceChildren(media);
-    state.fallbackTimer = setTimeout(() => failPlayback(state, 'Stream alternatif terlalu lama dimuat. Periksa koneksi lalu tekan Coba lagi.'), 30000);
+    let started = false;
+    let buffering = false;
+    function clearFallbackTimers() {
+      clearTimeout(state.fallbackStartupTimer);
+      clearTimeout(state.fallbackBufferTimer);
+    }
+    function waitForProgress() {
+      clearTimeout(state.fallbackBufferTimer);
+      state.fallbackBufferTimer = setTimeout(() => {
+        if (current()) failPlayback(state, 'Stream alternatif tidak mengirim data selama 60 detik. Periksa koneksi lalu tekan Coba lagi.');
+      }, 60000);
+    }
+    function receivedData() {
+      if (current() && buffering && !media.paused) waitForProgress();
+    }
+    // Long recordings must load separate audio/video playlists before playback can start.
+    function waitForStartup() {
+      clearTimeout(state.fallbackStartupTimer);
+      state.fallbackStartupTimer = setTimeout(() => {
+        if (current()) failPlayback(state, 'Persiapan stream alternatif melewati batas 90 detik. Periksa koneksi lalu tekan Coba lagi.');
+      }, 90000);
+    }
+    waitForStartup();
+    media.addEventListener('play', () => {
+      if (current() && !started) waitForStartup();
+    });
+    media.addEventListener('progress', receivedData);
     media.addEventListener('loadedmetadata', () => {
       if (!current() || !position) return;
       if (media.seekable.length) {
@@ -318,38 +350,52 @@ async function prepareFallback(state, position) {
         media.currentTime = Math.min(position, Math.max(0, media.duration - 0.1));
       }
     }, { once: true });
-    media.addEventListener('canplay', () => {
-      if (!current()) return;
-      clearTimeout(state.fallbackTimer);
-    });
     media.addEventListener('playing', () => {
       if (!current()) return;
-      clearTimeout(state.fallbackTimer);
+      started = true;
+      buffering = false;
+      clearFallbackTimers();
       setPlayerStatus('Sedang diputar melalui pemutar alternatif.', 'Pemutar alternatif');
     });
     media.addEventListener('pause', () => {
       if (!current() || media.ended) return;
-      clearTimeout(state.fallbackTimer);
+      buffering = false;
+      clearFallbackTimers();
       setPlayerStatus('Dijeda — pemutar alternatif.', 'Pemutar alternatif');
     });
     media.addEventListener('waiting', () => {
       if (!current() || media.paused) return;
       setPlayerStatus('Memuat stream alternatif…', 'Pemutar alternatif');
-      clearTimeout(state.fallbackTimer);
-      state.fallbackTimer = setTimeout(() => failPlayback(state, 'Stream alternatif berhenti merespons. Tekan Coba lagi.'), 30000);
+      if (!started || buffering) return;
+      buffering = true;
+      waitForProgress();
     });
     media.addEventListener('ended', () => {
-      if (current()) setPlayerStatus('Selesai diputar — pemutar alternatif.', 'Pemutar alternatif');
+      if (!current()) return;
+      buffering = false;
+      clearFallbackTimers();
+      setPlayerStatus('Selesai diputar — pemutar alternatif.', 'Pemutar alternatif');
     });
     media.addEventListener('error', () => {
       if (!current()) return;
-      if (nativeHls && media.error?.code === 2 && !state.renewed) renewFallback(state);
+      if ((mp4 || nativeHls) && media.error?.code === 2 && !state.renewed) renewFallback(state);
       else failPlayback(state, 'Stream alternatif tidak dapat diputar. Tekan Coba lagi atau pilih video lain.');
     });
-    if (nativeHls) media.src = data.manifestUrl;
+    if (mp4 || nativeHls) media.src = mp4 ? data.mediaUrl : data.manifestUrl;
     else {
-      const hls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 60 });
+      const hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        playlistLoadPolicy: { default: {
+          ...Hls.DefaultConfig.playlistLoadPolicy.default,
+          maxTimeToFirstByteMs: 60000,
+          maxLoadTimeMs: 60000
+        } }
+      });
       state.hls = hls;
+      for (const event of [Hls.Events.MANIFEST_LOADED, Hls.Events.LEVEL_LOADED, Hls.Events.AUDIO_TRACK_LOADED, Hls.Events.FRAG_LOADED]) {
+        hls.on(event, receivedData);
+      }
       hls.on(Hls.Events.ERROR, (_event, details) => {
         if (!current() || state.preparing) return;
         const code = details.response?.code;
@@ -367,7 +413,8 @@ async function prepareFallback(state, position) {
     media.play().catch(error => {
       if (!current()) return;
       if (error.name === 'NotAllowedError') {
-        clearTimeout(state.fallbackTimer);
+        buffering = false;
+        clearFallbackTimers();
         setPlayerStatus('Browser menahan autoplay. Tekan Play di pemutar alternatif.', 'Pemutar alternatif');
       } else if (error.name !== 'AbortError') failPlayback(state, 'Stream alternatif tidak dapat diputar. Tekan Coba lagi.');
     });
